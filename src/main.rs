@@ -79,7 +79,7 @@ use kingfisher::{
     rule_loader::RuleLoader,
     rules_database::RulesDatabase,
     scanner::{load_and_record_rules, run_scan},
-    update::check_for_update_async,
+    update::{check_for_update_async, rewrite_argv_for_reexec},
     validation::set_user_agent_suffix,
 };
 use serde_json::json;
@@ -113,6 +113,13 @@ fn main() -> anyhow::Result<()> {
 
     let handler = builder.spawn(run).expect("failed to spawn main thread");
     handler.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+/// Outcome of `async_main`. Used to signal that the runtime should be torn down
+/// and the process should re-exec into a freshly self-updated binary.
+enum AsyncMainOutcome {
+    Done,
+    Reexec,
 }
 
 fn run() -> anyhow::Result<()> {
@@ -154,7 +161,97 @@ fn run() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("Failed to create Tokio runtime")?;
-    runtime.block_on(async_main(args))
+    let outcome = runtime.block_on(async_main(args))?;
+    // Drop the Tokio runtime before re-exec so background tasks, file descriptors,
+    // and signal handlers are torn down cleanly. On Unix `exec()` replaces the process
+    // image regardless, but draining the runtime first avoids surprising shutdown
+    // ordering when the re-exec happens to fail.
+    drop(runtime);
+
+    match outcome {
+        AsyncMainOutcome::Done => Ok(()),
+        AsyncMainOutcome::Reexec => {
+            // On Unix, a successful exec() never returns; on Windows, reexec_with_new_binary
+            // calls process::exit. We only reach here if the re-exec failed before transferring
+            // control. The on-disk binary is now the updated version, so re-running the same
+            // command will work — but the original command has NOT executed, so we must not
+            // exit 0 and let CI think the run succeeded.
+            if let Err(e) = reexec_with_new_binary() {
+                error!(
+                    "Binary was updated but re-exec failed: {e}. The original command did not \
+                     run. Re-run the command to use the new binary."
+                );
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Re-exec the current process into the binary at `current_exe()` so a freshly
+/// self-updated binary takes over the current invocation.
+///
+/// Argv is rewritten via [`rewrite_argv_for_reexec`] to prevent loops and to skip the
+/// next update check.
+///
+/// On Unix this calls `exec()` which replaces the process image — same PID, parent
+/// shell sees the new binary's exit code directly.
+///
+/// On Windows there is no true `exec()`. Standard practice (rustup, cargo) is to spawn
+/// the new binary, wait, and propagate its exit code. This adds a parent process layer
+/// but preserves the parent shell's child-process tracking.
+fn reexec_with_new_binary() -> std::io::Result<()> {
+    use std::process::Command;
+
+    let exe = std::env::current_exe()?;
+    let argv: Vec<std::ffi::OsString> = rewrite_argv_for_reexec(std::env::args_os());
+
+    // Defensive: rewrite_argv_for_reexec returns an empty Vec only when args_os() was empty,
+    // which shouldn't happen for a real CLI invocation but would produce a child process with
+    // no argv[0]. Bail rather than spawn something nonsensical.
+    if argv.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot re-exec: process started with empty argv",
+        ));
+    }
+
+    // Make sure prior stderr/stdout output (e.g. "Updated to version X") is committed
+    // before we either replace the process image (Unix) or spawn the child (Windows). On
+    // Windows the child inherits the same handles, so leftover buffered output from the
+    // parent could otherwise interleave with the child's output unpredictably.
+    let _ = std::io::stdout().flush();
+    let _ = writeln!(std::io::stderr(), "Restarting with updated binary...");
+    let _ = std::io::stderr().flush();
+
+    // Safe by the is_empty() guard above.
+    let argv0 = argv[0].clone();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = Command::new(&exe).args(argv.iter().skip(1)).arg0(&argv0).exec();
+        // exec() returns only on failure.
+        Err(err)
+    }
+
+    #[cfg(windows)]
+    {
+        // arg0 spoofing isn't available on Windows; the child sees the resolved exe path
+        // as argv[0]. The user-visible difference is cosmetic.
+        let _ = argv0;
+        let status = Command::new(&exe).args(argv.iter().skip(1)).status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (exe, argv0);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "re-exec is not supported on this platform",
+        ))
+    }
 }
 
 fn setup_logging(global_args: &GlobalArgs) {
@@ -235,20 +332,26 @@ pub fn determine_exit_code(datastore: &Arc<Mutex<findings_store::FindingsStore>>
     }
 }
 
-async fn async_main(args: CommandLineArgs) -> Result<()> {
+async fn async_main(args: CommandLineArgs) -> Result<AsyncMainOutcome> {
     setup_logging(&args.global_args);
     let global_args = args.global_args.clone();
 
     match args.command {
         Command::SelfUpdate => {
+            // The explicit `kingfisher self-update` subcommand intentionally does NOT
+            // re-exec after updating: it has no further work to do, so simply exiting
+            // is the correct end-of-run behavior. The re-exec path is reserved for the
+            // global `--self-update` flag combined with another command (e.g. `scan`).
             let mut g = global_args;
             g.self_update = true;
             g.no_update_check = false;
             let _ = check_for_update_async(&g, None).await;
-            Ok(())
+            Ok(AsyncMainOutcome::Done)
         }
-        Command::View(view_args) => view::run(view_args).await,
-        Command::AccessMap(identity_args) => access_map::run(identity_args).await,
+        Command::View(view_args) => view::run(view_args).await.map(|_| AsyncMainOutcome::Done),
+        Command::AccessMap(identity_args) => {
+            access_map::run(identity_args).await.map(|_| AsyncMainOutcome::Done)
+        }
         Command::Validate(validate_args) => {
             let results =
                 direct_validate::run_direct_validation(&validate_args, &global_args).await?;
@@ -256,7 +359,7 @@ async fn async_main(args: CommandLineArgs) -> Result<()> {
             direct_validate::print_results(&results, &validate_args.format, use_color);
             // Exit with code 0 if any result is valid, 1 if all invalid
             if direct_validate::any_valid(&results) {
-                Ok(())
+                Ok(AsyncMainOutcome::Done)
             } else {
                 std::process::exit(1);
             }
@@ -267,13 +370,19 @@ async fn async_main(args: CommandLineArgs) -> Result<()> {
             direct_revoke::print_results(&results, &revoke_args.format, use_color);
             // Exit with code 0 if any result revoked, 1 if all failed
             if direct_revoke::any_revoked(&results) {
-                Ok(())
+                Ok(AsyncMainOutcome::Done)
             } else {
                 std::process::exit(1);
             }
         }
         command => {
             let update_status = check_for_update_async(&global_args, None).await;
+            // If the on-disk binary was just replaced by --self-update, return early so
+            // fn run() can drop the runtime and re-exec into the new binary. The current
+            // invocation will resume with the new code (e.g. updated rule set).
+            if update_status.was_self_updated {
+                return Ok(AsyncMainOutcome::Reexec);
+            }
             match command {
                 Command::Scan(scan_command) => match scan_command.into_operation()? {
                     ScanOperation::Scan(mut scan_args) => {
@@ -503,7 +612,7 @@ async fn async_main(args: CommandLineArgs) -> Result<()> {
             if let Some(message) = &update_status.message {
                 info!("{}", message);
             }
-            Ok(())
+            Ok(AsyncMainOutcome::Done)
         }
     }
 }

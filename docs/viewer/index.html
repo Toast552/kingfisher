@@ -6401,13 +6401,22 @@
       const section = document.createElement("div");
       section.className = "am-provider-section";
 
+      // In "Critical only" mode, the cards rendered below exclude read-only
+      // permissions; aggregate the section header stats from the same
+      // filtered view so resource / unique-perm counts and the severity
+      // chips match what the user actually sees.
+      const criticalMode = isCriticalOnly();
       let totalRes = 0;
       const permSet = new Set();
       let admin = 0;
       let privesc = 0;
       let risky = 0;
       entries.forEach((e) => {
-        (e.groups || []).forEach((g) => {
+        const byClass = e.identity && e.identity.permissions_by_severity;
+        const groups = criticalMode
+          ? (e.groups || []).map((g) => applyCriticalFilter(g, byClass))
+          : (e.groups || []);
+        groups.forEach((g) => {
           totalRes += (g.resources || []).length;
           (g.permissions || []).forEach((p) => permSet.add(p));
         });
@@ -6472,6 +6481,16 @@
           + (e.permissions_by_severity.read_only || []).length
         ) > 0
       );
+      // When no entries are classified, the toggle is meaningless — but if
+      // the user previously enabled it, the persisted setting would still
+      // drive the filter and could leave them with an empty access-map view
+      // and no UI to disable it. Clear the persisted state and uncheck the
+      // input so the filter no longer applies on this report.
+      if (!anyClassified) {
+        const input = wrap.querySelector('input[type="checkbox"]');
+        if (input) input.checked = false;
+        setCriticalOnly(false);
+      }
       wrap.style.display = anyClassified ? "" : "none";
     }
 
@@ -6606,10 +6625,15 @@
       info.appendChild(meta);
 
       // Severity rollup chips replace the per-permission preview.
+      // In "Critical only" mode the expanded view hides read-only permissions;
+      // suppress the read_only chip too so the rollup matches what's rendered
+      // (otherwise the header still advertises a count the body never shows).
+      const rollupCriticalMode = isCriticalOnly();
       if (byClass && (sevSummary.admin + sevSummary.privilege_escalation + sevSummary.risky + sevSummary.read_only) > 0) {
         const rollup = document.createElement("div");
         rollup.className = "id-card__rollup";
         SEVERITY_BUCKETS.forEach(({ key, label, cls }) => {
+          if (rollupCriticalMode && key === "read_only") return;
           const n = sevSummary[key];
           if (!n) return;
           const chip = document.createElement("span");

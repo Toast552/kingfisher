@@ -80,14 +80,18 @@ rules:
       content:
         request:
           method: POST
-          url: https://{{ DOMAIN }}/auth/oauth2/token
+          # OneLogin's `/auth/oauth2/v2/token` accepts the standard OAuth 2.0
+          # client-credentials flow with HTTP Basic auth (base64 of
+          # `client_id:client_secret`). The earlier comma-separated
+          # `Authorization: client_id:..., client_secret:...` form was never
+          # the documented standard — it appears in OneLogin error messages
+          # only as an example of what *not* to do — so the validator was
+          # always returning a 4xx and never confirming credentials.
+          url: https://{{ DOMAIN }}/auth/oauth2/v2/token
           headers:
-            Content-Type: application/json
-            Authorization: "client_id:{{ CLIENT_ID }}, client_secret:{{ TOKEN }}"
-          body: |
-            {
-              "grant_type": "client_credentials"
-            }
+            Content-Type: application/x-www-form-urlencoded
+            Authorization: "Basic {{ CLIENT_ID | append: ':' | append: TOKEN | b64enc }}"
+          body: grant_type=client_credentials
           response_matcher:
             - report_response: true
             - type: StatusMatch

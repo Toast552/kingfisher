@@ -96,6 +96,7 @@ nav:
   - Usage:
     - Basic Scanning: usage/basic-scanning.md
     - Platform Integrations: usage/integrations.md
+    - Project Configuration (kingfisher.yaml): usage/configuration.md
     - Advanced Configuration: usage/advanced.md
     - Baseline Management: usage/baseline.md
     - Deployment: usage/deployment.md

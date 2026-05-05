@@ -629,8 +629,8 @@ pub async fn run_direct_validation(
                         // leak credentials into stderr when -v is on.
                         debug!("HTTP validation failed");
                         DirectValidationResult {
-                            rule_id: String::new(),
-                            rule_name: String::new(),
+                            rule_id: rule_id.clone(),
+                            rule_name: rule_name.clone(),
                             is_valid: false,
                             status_code: None,
                             message: "HTTP validation failed".to_string(),
@@ -652,8 +652,8 @@ pub async fn run_direct_validation(
                     Err(_e) => {
                         debug!("gRPC validation failed");
                         DirectValidationResult {
-                            rule_id: String::new(),
-                            rule_name: String::new(),
+                            rule_id: rule_id.clone(),
+                            rule_name: rule_name.clone(),
                             is_valid: false,
                             status_code: None,
                             message: "gRPC validation failed".to_string(),
@@ -1081,6 +1081,14 @@ pub(crate) fn create_minimal_scan_args() -> crate::cli::commands::scan::ScanArgs
         no_ignore_if_contains: false,
         view_report_port: 7890,
         view_report_address: "127.0.0.1".to_string(),
+        alert_webhook: Vec::new(),
+        alert_format: None,
+        alert_on: crate::alerts::AlertOn::Findings,
+        alert_min_confidence: ConfidenceLevel::Medium,
+        alert_include_secret: false,
+        alert_report_url: None,
+        alert_detail: crate::alerts::AlertDetail::Auto,
+        config_webhook_overrides: Vec::new(),
         validation_timeout: 10,
         validation_retries: 1,
         validation_rps: None,

@@ -132,7 +132,7 @@ pub struct ScanArgs {
     /// Map validated cloud credentials to their effective identities; use only when
     /// authorized for the target account because this triggers additional network
     /// requests to determine granted access
-    #[arg(global = true, long, default_value_t = false)]
+    #[arg(global = true, long, alias = "blast-radius", default_value_t = false)]
     pub access_map: bool,
 
     // /// Optional path to write a consolidated access-map HTML report
@@ -222,6 +222,77 @@ pub struct ScanArgs {
     pub view_report_port: u16,
     #[arg(skip)]
     pub view_report_address: String,
+
+    /// POST scan results to a webhook URL when scanning completes (repeatable).
+    /// Use multiple `--alert-webhook` flags to fan out to several destinations.
+    #[arg(global = true, long = "alert-webhook", value_name = "URL")]
+    pub alert_webhook: Vec<String>,
+
+    /// Format for `--alert-webhook` payloads. Default is inferred from the URL
+    /// host (slack.com → slack, *.office.com → teams, discord.com → discord,
+    /// chat.googleapis.com → googlechat, otherwise generic). Mattermost is
+    /// self-hosted and never inferred — pass `--alert-format mattermost`
+    /// explicitly.
+    #[arg(global = true, long = "alert-format", value_name = "FORMAT")]
+    pub alert_format: Option<crate::alerts::AlertFormat>,
+
+    /// When to post alerts: only when there are findings, or always.
+    #[arg(global = true, long = "alert-on", value_name = "MODE", default_value = "findings")]
+    pub alert_on: crate::alerts::AlertOn,
+
+    /// Minimum confidence required for a finding to be included in alert payloads.
+    #[arg(
+        global = true,
+        long = "alert-min-confidence",
+        value_name = "LEVEL",
+        default_value = "medium"
+    )]
+    pub alert_min_confidence: ConfidenceLevel,
+
+    /// Include the (possibly truncated) secret value in alert payloads.
+    /// Off by default; on, the snippet is truncated to ~32 chars.
+    #[arg(global = true, long = "alert-include-secret", default_value_t = false)]
+    pub alert_include_secret: bool,
+
+    /// Pivot link rendered in the payload — typically the URL of the full
+    /// scan report (CI run, S3 object, SARIF in Code Scanning, etc.). When
+    /// present, every alert payload includes a "Full report" link, which is
+    /// the right place to send operators who hit the truncated finding cap.
+    /// Falls back to env var `KINGFISHER_ALERT_REPORT_URL` if unset.
+    #[arg(
+        global = true,
+        long = "alert-report-url",
+        value_name = "URL",
+        env = "KINGFISHER_ALERT_REPORT_URL"
+    )]
+    pub alert_report_url: Option<String>,
+
+    /// How much per-finding detail to include in alert payloads. `auto`
+    /// (default) shows up to 10 findings inline, but switches to a
+    /// summary-only payload once the per-sink filtered finding count exceeds
+    /// 25 — at that volume, chat detail blocks add noise and the operator
+    /// should be pivoting to the full report instead.
+    #[arg(global = true, long = "alert-detail", value_name = "MODE", default_value = "auto")]
+    pub alert_detail: crate::alerts::AlertDetail,
+
+    /// Per-webhook overrides loaded from `kingfisher.yaml`. Indexed in lockstep
+    /// with `alert_webhook` for the trailing config-sourced URLs. Not parsed
+    /// from the CLI; populated by `apply_config` in main.rs.
+    #[arg(skip)]
+    pub config_webhook_overrides: Vec<ConfigWebhookOverride>,
+}
+
+/// Override values for a webhook entry that came from the config file.
+/// Each field that is `None` falls back to the corresponding `--alert-*` CLI
+/// flag's value.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigWebhookOverride {
+    pub format: Option<crate::alerts::AlertFormat>,
+    pub on: Option<crate::alerts::AlertOn>,
+    pub min_confidence: Option<ConfidenceLevel>,
+    pub include_secret: Option<bool>,
+    pub report_url: Option<String>,
+    pub detail: Option<crate::alerts::AlertDetail>,
 }
 
 /// Confidence levels for findings

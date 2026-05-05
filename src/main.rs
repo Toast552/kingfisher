@@ -79,7 +79,7 @@ use kingfisher::{
     rule_loader::RuleLoader,
     rules_database::RulesDatabase,
     scanner::{load_and_record_rules, run_scan},
-    update::check_for_update_async,
+    update::{check_for_update_async, rewrite_argv_for_reexec},
     validation::set_user_agent_suffix,
 };
 use serde_json::json;
@@ -115,6 +115,13 @@ fn main() -> anyhow::Result<()> {
     handler.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
 }
 
+/// Outcome of `async_main`. Used to signal that the runtime should be torn down
+/// and the process should re-exec into a freshly self-updated binary.
+enum AsyncMainOutcome {
+    Done,
+    Reexec,
+}
+
 fn run() -> anyhow::Result<()> {
     // Rustls 0.23 requires an explicit crypto provider selection when multiple
     // providers are present in the dependency graph.
@@ -126,8 +133,12 @@ fn run() -> anyhow::Result<()> {
             warn!("rustls crypto provider was already installed; keeping existing provider");
         }
     }
-    // Parse command-line arguments
-    let CommandLineArgs { command, global_args } = CommandLineArgs::parse_args();
+    // Parse command-line arguments. We keep the raw `ArgMatches` so
+    // `apply_config` can distinguish a user-provided flag from a clap default
+    // and apply project-config scalars only when the user did not pass the
+    // matching CLI flag (precedence: CLI > env > config > built-in default).
+    let (CommandLineArgs { command, global_args }, matches) =
+        CommandLineArgs::parse_args_with_matches();
 
     set_user_agent_suffix(global_args.user_agent_suffix.clone());
 
@@ -142,6 +153,7 @@ fn run() -> anyhow::Result<()> {
         Command::Revoke(_) => 1,   // Single revocation request
         Command::AccessMap(_) => 1,
         Command::View(_) => 1,
+        Command::Config(_) => 1,
     };
 
     // Set up the Tokio runtime with the specified number of threads.
@@ -154,7 +166,97 @@ fn run() -> anyhow::Result<()> {
         .enable_all()
         .build()
         .context("Failed to create Tokio runtime")?;
-    runtime.block_on(async_main(args))
+    let outcome = runtime.block_on(async_main(args, matches))?;
+    // Drop the Tokio runtime before re-exec so background tasks, file descriptors,
+    // and signal handlers are torn down cleanly. On Unix `exec()` replaces the process
+    // image regardless, but draining the runtime first avoids surprising shutdown
+    // ordering when the re-exec happens to fail.
+    drop(runtime);
+
+    match outcome {
+        AsyncMainOutcome::Done => Ok(()),
+        AsyncMainOutcome::Reexec => {
+            // On Unix, a successful exec() never returns; on Windows, reexec_with_new_binary
+            // calls process::exit. We only reach here if the re-exec failed before transferring
+            // control. The on-disk binary is now the updated version, so re-running the same
+            // command will work — but the original command has NOT executed, so we must not
+            // exit 0 and let CI think the run succeeded.
+            if let Err(e) = reexec_with_new_binary() {
+                error!(
+                    "Binary was updated but re-exec failed: {e}. The original command did not \
+                     run. Re-run the command to use the new binary."
+                );
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Re-exec the current process into the binary at `current_exe()` so a freshly
+/// self-updated binary takes over the current invocation.
+///
+/// Argv is rewritten via [`rewrite_argv_for_reexec`] to prevent loops and to skip the
+/// next update check.
+///
+/// On Unix this calls `exec()` which replaces the process image — same PID, parent
+/// shell sees the new binary's exit code directly.
+///
+/// On Windows there is no true `exec()`. Standard practice (rustup, cargo) is to spawn
+/// the new binary, wait, and propagate its exit code. This adds a parent process layer
+/// but preserves the parent shell's child-process tracking.
+fn reexec_with_new_binary() -> std::io::Result<()> {
+    use std::process::Command;
+
+    let exe = std::env::current_exe()?;
+    let argv: Vec<std::ffi::OsString> = rewrite_argv_for_reexec(std::env::args_os());
+
+    // Defensive: rewrite_argv_for_reexec returns an empty Vec only when args_os() was empty,
+    // which shouldn't happen for a real CLI invocation but would produce a child process with
+    // no argv[0]. Bail rather than spawn something nonsensical.
+    if argv.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "cannot re-exec: process started with empty argv",
+        ));
+    }
+
+    // Make sure prior stderr/stdout output (e.g. "Updated to version X") is committed
+    // before we either replace the process image (Unix) or spawn the child (Windows). On
+    // Windows the child inherits the same handles, so leftover buffered output from the
+    // parent could otherwise interleave with the child's output unpredictably.
+    let _ = std::io::stdout().flush();
+    let _ = writeln!(std::io::stderr(), "Restarting with updated binary...");
+    let _ = std::io::stderr().flush();
+
+    // Safe by the is_empty() guard above.
+    let argv0 = argv[0].clone();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = Command::new(&exe).args(argv.iter().skip(1)).arg0(&argv0).exec();
+        // exec() returns only on failure.
+        Err(err)
+    }
+
+    #[cfg(windows)]
+    {
+        // arg0 spoofing isn't available on Windows; the child sees the resolved exe path
+        // as argv[0]. The user-visible difference is cosmetic.
+        let _ = argv0;
+        let status = Command::new(&exe).args(argv.iter().skip(1)).status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (exe, argv0);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "re-exec is not supported on this platform",
+        ))
+    }
 }
 
 fn setup_logging(global_args: &GlobalArgs) {
@@ -193,6 +295,823 @@ fn setup_logging(global_args: &GlobalArgs) {
         .with(fmt_layer) // Attach the formatter layer
         .with(filter) // Attach the filter
         .init();
+}
+
+/// Resolve and read a `kingfisher.yaml` project config.
+/// - Explicit `--config <PATH>` is required to exist; missing/unreadable is an error.
+/// - Otherwise we walk up from CWD looking for `kingfisher.yaml`. Missing is fine.
+fn load_project_config(
+    explicit: Option<&std::path::Path>,
+) -> Result<Option<kingfisher::cli::config::KingfisherConfig>> {
+    let path = match explicit {
+        Some(p) => Some(p.to_path_buf()),
+        None => {
+            let cwd = std::env::current_dir().context("read CWD for config discovery")?;
+            kingfisher::cli::config::discover_path(&cwd)
+        }
+    };
+    match path {
+        Some(p) => {
+            let bytes =
+                std::fs::read(&p).with_context(|| format!("read config {}", p.display()))?;
+            let yaml = String::from_utf8(bytes)
+                .with_context(|| format!("config {} is not UTF-8", p.display()))?;
+            let cfg = kingfisher::cli::config::parse_str(&yaml)
+                .with_context(|| format!("parse config {}", p.display()))?;
+            info!("loaded config from {}", p.display());
+            Ok(Some(cfg))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Merge config-file values into clap-parsed args.
+///
+/// **Lists/maps**: always concatenated onto the CLI value (additive).
+///
+/// **Scalars**: applied only when the user did not pass the matching CLI
+/// flag, detected via [`clap::ArgMatches::value_source`]. A `Some(_)` config
+/// value still loses to a CLI-supplied flag or an explicit env-var, but wins
+/// over a clap `default_value_t`. This preserves precedence
+/// **CLI > env > config > built-in default**.
+fn apply_config(
+    scan_args: &mut cli::commands::scan::ScanArgs,
+    global_args: &mut GlobalArgs,
+    cfg: &kingfisher::cli::config::KingfisherConfig,
+    scan_matches: Option<&clap::ArgMatches>,
+) {
+    use clap::parser::ValueSource;
+
+    /// True when the named arg was either absent or filled in with its clap
+    /// default — i.e. the user did not pass `--<flag>` on the CLI and did
+    /// not set its `env = ...`. In those cases the config value should win.
+    fn config_wins(matches: Option<&clap::ArgMatches>, id: &str) -> bool {
+        match matches.and_then(|m| m.value_source(id)) {
+            None => true,
+            Some(ValueSource::DefaultValue) => true,
+            _ => false,
+        }
+    }
+
+    // ---------- Filters: existing v1 list-typed merges ----------------------
+    scan_args.skip_word.extend(cfg.filters.skip_words.iter().cloned());
+    scan_args.skip_regex.extend(cfg.filters.skip_regex.iter().cloned());
+    scan_args.content_filtering_args.exclude.extend(cfg.filters.exclude.iter().cloned());
+
+    // ---------- scan: behavioral scalars ------------------------------------
+    if let Some(c) = cfg.scan.confidence {
+        if config_wins(scan_matches, "confidence") {
+            scan_args.confidence = c.into();
+        }
+    }
+    if let Some(e) = cfg.scan.min_entropy {
+        if config_wins(scan_matches, "min_entropy") {
+            scan_args.min_entropy = Some(e);
+        }
+    }
+    if let Some(v) = cfg.scan.no_validate {
+        if config_wins(scan_matches, "no_validate") {
+            scan_args.no_validate = v;
+        }
+    }
+    if let Some(v) = cfg.scan.only_valid {
+        if config_wins(scan_matches, "only_valid") {
+            scan_args.only_valid = v;
+        }
+    }
+    if let Some(v) = cfg.scan.redact {
+        if config_wins(scan_matches, "redact") {
+            scan_args.redact = v;
+        }
+    }
+    if let Some(v) = cfg.scan.no_dedup {
+        if config_wins(scan_matches, "no_dedup") {
+            scan_args.no_dedup = v;
+        }
+    }
+    if let Some(v) = cfg.scan.turbo {
+        if config_wins(scan_matches, "turbo") {
+            scan_args.turbo = v;
+        }
+    }
+    if let Some(v) = cfg.scan.no_base64 {
+        if config_wins(scan_matches, "no_base64") {
+            scan_args.no_base64 = v;
+        }
+    }
+    if let Some(v) = cfg.scan.access_map {
+        if config_wins(scan_matches, "access_map") {
+            scan_args.access_map = v;
+        }
+    }
+    if let Some(v) = cfg.scan.rule_stats {
+        if config_wins(scan_matches, "rule_stats") {
+            scan_args.rule_stats = v;
+        }
+    }
+    if let Some(j) = cfg.scan.jobs {
+        if config_wins(scan_matches, "num_jobs") {
+            scan_args.num_jobs = j;
+        }
+    }
+    if let Some(t) = cfg.scan.git_repo_timeout {
+        if config_wins(scan_matches, "git_repo_timeout") {
+            scan_args.git_repo_timeout = t;
+        }
+    }
+
+    // ---------- rules ------------------------------------------------------
+    // `rule` and `rules_path` are list-typed; concatenate. Note: clap's default
+    // for `--rule` is `["all"]`, so unconditionally appending could grow the
+    // selection in surprising ways. Only append when the user did not pass
+    // `--rule` (i.e. the default is in effect).
+    if !cfg.rules.enabled.is_empty() {
+        if config_wins(scan_matches, "rule") {
+            // Replace the synthetic clap default with the config selection.
+            scan_args.rules.rule = cfg.rules.enabled.clone();
+        } else {
+            scan_args.rules.rule.extend(cfg.rules.enabled.iter().cloned());
+        }
+    }
+    scan_args.rules.rules_path.extend(cfg.rules.paths.iter().cloned());
+    if let Some(v) = cfg.rules.load_builtins {
+        if config_wins(scan_matches, "load_builtins") {
+            scan_args.rules.load_builtins = v;
+        }
+    }
+
+    // ---------- validation -------------------------------------------------
+    if let Some(t) = cfg.validation.timeout {
+        if config_wins(scan_matches, "validation_timeout") {
+            scan_args.validation_timeout = t;
+        }
+    }
+    if let Some(r) = cfg.validation.retries {
+        if config_wins(scan_matches, "validation_retries") {
+            scan_args.validation_retries = r;
+        }
+    }
+    if let Some(rps) = cfg.validation.rps {
+        if config_wins(scan_matches, "validation_rps") {
+            scan_args.validation_rps = Some(rps);
+        }
+    }
+    for (rule, rps) in &cfg.validation.rps_per_rule {
+        scan_args.validation_rps_rule.push(format!("{rule}={rps}"));
+    }
+    if let Some(v) = cfg.validation.full_response {
+        if config_wins(scan_matches, "full_validation_response") {
+            scan_args.full_validation_response = v;
+        }
+    }
+    if let Some(n) = cfg.validation.max_response_length {
+        if config_wins(scan_matches, "max_validation_response_length") {
+            scan_args.max_validation_response_length = n;
+        }
+    }
+
+    // ---------- filters (v2 scalars + extra additive lists) ----------------
+    if let Some(mb) = cfg.filters.max_file_size_mb {
+        if config_wins(scan_matches, "max_file_size_mb") {
+            scan_args.content_filtering_args.max_file_size_mb = mb;
+        }
+    }
+    if let Some(v) = cfg.filters.no_binary {
+        if config_wins(scan_matches, "no_binary") {
+            scan_args.content_filtering_args.no_binary = v;
+        }
+    }
+    if let Some(v) = cfg.filters.no_extract_archives {
+        if config_wins(scan_matches, "no_extract_archives") {
+            scan_args.content_filtering_args.no_extract_archives = v;
+        }
+    }
+    if let Some(d) = cfg.filters.extraction_depth {
+        if config_wins(scan_matches, "extraction_depth") {
+            scan_args.content_filtering_args.extraction_depth = d;
+        }
+    }
+    if let Some(v) = cfg.filters.no_inline_ignore {
+        if config_wins(scan_matches, "no_inline_ignore") {
+            scan_args.no_inline_ignore = v;
+        }
+    }
+    if let Some(v) = cfg.filters.no_ignore_if_contains {
+        if config_wins(scan_matches, "no_ignore_if_contains") {
+            scan_args.no_ignore_if_contains = v;
+        }
+    }
+    scan_args.extra_ignore_comments.extend(cfg.filters.extra_ignore_comments.iter().cloned());
+    scan_args.skip_aws_account.extend(cfg.filters.skip_aws_accounts.iter().cloned());
+    if let Some(p) = &cfg.filters.skip_aws_account_file {
+        if config_wins(scan_matches, "skip_aws_account_file") {
+            scan_args.skip_aws_account_file = Some(p.clone());
+        }
+    }
+
+    // ---------- output -----------------------------------------------------
+    if let Some(f) = cfg.output.format {
+        if config_wins(scan_matches, "format") {
+            scan_args.output_args.format = f.into();
+        }
+    }
+    if let Some(p) = &cfg.output.path {
+        if config_wins(scan_matches, "output") {
+            scan_args.output_args.output = Some(p.clone());
+        }
+    }
+
+    // ---------- baseline ---------------------------------------------------
+    if let Some(p) = &cfg.baseline.file {
+        if config_wins(scan_matches, "baseline_file") {
+            scan_args.baseline_file = Some(p.clone());
+        }
+    }
+    if let Some(v) = cfg.baseline.manage {
+        if config_wins(scan_matches, "manage_baseline") {
+            scan_args.manage_baseline = v;
+        }
+    }
+
+    // ---------- alerts.defaults: feed the global --alert-* fields ----------
+    if let Some(f) = cfg.alerts.defaults.format {
+        if config_wins(scan_matches, "alert_format") {
+            scan_args.alert_format = Some(f);
+        }
+    }
+    if let Some(o) = cfg.alerts.defaults.on {
+        if config_wins(scan_matches, "alert_on") {
+            scan_args.alert_on = o;
+        }
+    }
+    if let Some(c) = cfg.alerts.defaults.min_confidence {
+        if config_wins(scan_matches, "alert_min_confidence") {
+            scan_args.alert_min_confidence = c.into();
+        }
+    }
+    if let Some(v) = cfg.alerts.defaults.include_secret {
+        if config_wins(scan_matches, "alert_include_secret") {
+            scan_args.alert_include_secret = v;
+        }
+    }
+    if let Some(u) = &cfg.alerts.defaults.report_url {
+        if config_wins(scan_matches, "alert_report_url") {
+            scan_args.alert_report_url = Some(u.clone());
+        }
+    }
+    if let Some(d) = cfg.alerts.defaults.detail {
+        if config_wins(scan_matches, "alert_detail") {
+            scan_args.alert_detail = d;
+        }
+    }
+
+    // ---------- alerts.webhooks: append URLs (existing v1 behavior) --------
+    for w in &cfg.alerts.webhooks {
+        scan_args.alert_webhook.push(w.url.clone());
+        scan_args.config_webhook_overrides.push(
+            kingfisher::cli::commands::scan::ConfigWebhookOverride {
+                format: w.format,
+                on: w.on,
+                min_confidence: w.min_confidence.map(Into::into),
+                include_secret: w.include_secret,
+                report_url: w.report_url.clone(),
+                detail: w.detail,
+            },
+        );
+    }
+
+    // ---------- global -----------------------------------------------------
+    if let Some(m) = cfg.global.tls_mode {
+        if config_wins(scan_matches, "tls_mode") {
+            global_args.tls_mode = m.into();
+        }
+    }
+    if let Some(v) = cfg.global.allow_internal_ips {
+        if config_wins(scan_matches, "allow_internal_ips") {
+            global_args.allow_internal_ips = v;
+        }
+    }
+    if let Some(v) = cfg.global.no_update_check {
+        if config_wins(scan_matches, "no_update_check") {
+            global_args.no_update_check = v;
+        }
+    }
+    if let Some(s) = &cfg.global.user_agent_suffix {
+        if config_wins(scan_matches, "user_agent_suffix") {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                global_args.user_agent_suffix = Some(trimmed.to_string());
+            }
+        }
+    }
+    global_args.endpoint.extend(cfg.global.endpoints.iter().cloned());
+    if let Some(p) = &cfg.global.endpoint_config {
+        if config_wins(scan_matches, "endpoint_config") {
+            global_args.endpoint_config = Some(p.clone());
+        }
+    }
+
+    // ---------- git --------------------------------------------------------
+    if let Some(p) = &cfg.git.clone_dir {
+        if config_wins(scan_matches, "git_clone_dir") {
+            scan_args.input_specifier_args.git_clone_dir = Some(p.clone());
+        }
+    }
+    if let Some(v) = cfg.git.keep_clones {
+        if config_wins(scan_matches, "keep_clones") {
+            scan_args.input_specifier_args.keep_clones = v;
+        }
+    }
+    if let Some(n) = cfg.git.repo_clone_limit {
+        if config_wins(scan_matches, "repo_clone_limit") {
+            scan_args.input_specifier_args.repo_clone_limit = Some(n);
+        }
+    }
+    if let Some(v) = cfg.git.include_contributors {
+        if config_wins(scan_matches, "include_contributors") {
+            scan_args.input_specifier_args.include_contributors = v;
+        }
+    }
+}
+
+/// Run `kingfisher config <subcommand>`.
+fn run_config_command(
+    config_args: kingfisher::cli::commands::config_command::ConfigArgs,
+    global_args: &GlobalArgs,
+    top_matches: &clap::ArgMatches,
+) -> Result<()> {
+    use kingfisher::cli::commands::config_command::ConfigSubcommand;
+
+    match config_args.command {
+        ConfigSubcommand::Init(init_args) => {
+            let init_matches = top_matches
+                .subcommand_matches("config")
+                .and_then(|m| m.subcommand_matches("init"))
+                .ok_or_else(|| anyhow::anyhow!("internal: missing `config init` matches"))?;
+
+            let yaml = build_config_yaml(&init_args.scan_args, global_args, init_matches)?;
+
+            match init_args.out.as_deref() {
+                Some(path) => {
+                    if !init_args.force && path.exists() {
+                        anyhow::bail!(
+                            "{} already exists. Pass --force to overwrite.",
+                            path.display()
+                        );
+                    }
+                    std::fs::write(path, &yaml)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    info!("wrote {}", path.display());
+                }
+                None => {
+                    let mut stdout = std::io::stdout().lock();
+                    stdout.write_all(yaml.as_bytes())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reverse of `apply_config`: walk the user-supplied flags from `ArgMatches`
+/// and emit a [`KingfisherConfig`] containing only the flags the user
+/// actually passed (CLI defaults are left out so the YAML stays minimal).
+fn build_config_yaml(
+    scan_args: &cli::commands::scan::ScanArgs,
+    global_args: &GlobalArgs,
+    sub_matches: &clap::ArgMatches,
+) -> Result<String> {
+    use clap::parser::ValueSource;
+    use kingfisher::cli::config::{
+        AlertsConfig, AlertsDefaultsConfig, BaselineConfig, FiltersConfig, GitConfig, GlobalConfig,
+        KingfisherConfig, OutputConfig, RulesConfig, ScanConfig, ValidationConfig, WebhookConfig,
+    };
+    use std::collections::BTreeMap;
+
+    fn user_set(matches: &clap::ArgMatches, id: &str) -> bool {
+        matches!(
+            matches.value_source(id),
+            Some(ValueSource::CommandLine | ValueSource::EnvVariable)
+        )
+    }
+
+    let mut cfg = KingfisherConfig::default();
+
+    // ---------- scan ----------------------------------------------------
+    let mut scan = ScanConfig::default();
+    if user_set(sub_matches, "confidence") {
+        scan.confidence = Some(scan_args.confidence.into());
+    }
+    if user_set(sub_matches, "min_entropy")
+        && let Some(e) = scan_args.min_entropy
+    {
+        scan.min_entropy = Some(e);
+    }
+    if user_set(sub_matches, "no_validate") {
+        scan.no_validate = Some(scan_args.no_validate);
+    }
+    if user_set(sub_matches, "only_valid") {
+        scan.only_valid = Some(scan_args.only_valid);
+    }
+    if user_set(sub_matches, "redact") {
+        scan.redact = Some(scan_args.redact);
+    }
+    if user_set(sub_matches, "no_dedup") {
+        scan.no_dedup = Some(scan_args.no_dedup);
+    }
+    if user_set(sub_matches, "turbo") {
+        scan.turbo = Some(scan_args.turbo);
+    }
+    if user_set(sub_matches, "no_base64") {
+        scan.no_base64 = Some(scan_args.no_base64);
+    }
+    if user_set(sub_matches, "access_map") {
+        scan.access_map = Some(scan_args.access_map);
+    }
+    if user_set(sub_matches, "rule_stats") {
+        scan.rule_stats = Some(scan_args.rule_stats);
+    }
+    if user_set(sub_matches, "num_jobs") {
+        scan.jobs = Some(scan_args.num_jobs);
+    }
+    if user_set(sub_matches, "git_repo_timeout") {
+        scan.git_repo_timeout = Some(scan_args.git_repo_timeout);
+    }
+    cfg.scan = scan;
+
+    // ---------- rules ---------------------------------------------------
+    let mut rules = RulesConfig::default();
+    if user_set(sub_matches, "rule") {
+        rules.enabled = scan_args.rules.rule.clone();
+    }
+    if !scan_args.rules.rules_path.is_empty() {
+        rules.paths = scan_args.rules.rules_path.clone();
+    }
+    if user_set(sub_matches, "load_builtins") {
+        rules.load_builtins = Some(scan_args.rules.load_builtins);
+    }
+    cfg.rules = rules;
+
+    // ---------- validation ---------------------------------------------
+    let mut validation = ValidationConfig::default();
+    if user_set(sub_matches, "validation_timeout") {
+        validation.timeout = Some(scan_args.validation_timeout);
+    }
+    if user_set(sub_matches, "validation_retries") {
+        validation.retries = Some(scan_args.validation_retries);
+    }
+    if user_set(sub_matches, "validation_rps")
+        && let Some(rps) = scan_args.validation_rps
+    {
+        validation.rps = Some(rps);
+    }
+    if !scan_args.validation_rps_rule.is_empty() {
+        let mut map = BTreeMap::new();
+        for entry in &scan_args.validation_rps_rule {
+            let (rule, rps) = entry
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("invalid --validation-rps-rule entry: {entry:?}"))?;
+            let rps: f64 = rps.parse().with_context(|| format!("invalid RPS in {entry:?}"))?;
+            map.insert(rule.trim().to_string(), rps);
+        }
+        validation.rps_per_rule = map;
+    }
+    if user_set(sub_matches, "full_validation_response") {
+        validation.full_response = Some(scan_args.full_validation_response);
+    }
+    if user_set(sub_matches, "max_validation_response_length") {
+        validation.max_response_length = Some(scan_args.max_validation_response_length);
+    }
+    cfg.validation = validation;
+
+    // ---------- filters --------------------------------------------------
+    let mut filters = FiltersConfig::default();
+    if !scan_args.skip_word.is_empty() {
+        filters.skip_words = scan_args.skip_word.clone();
+    }
+    if !scan_args.skip_regex.is_empty() {
+        filters.skip_regex = scan_args.skip_regex.clone();
+    }
+    if !scan_args.content_filtering_args.exclude.is_empty() {
+        filters.exclude = scan_args.content_filtering_args.exclude.clone();
+    }
+    if user_set(sub_matches, "max_file_size_mb") {
+        filters.max_file_size_mb = Some(scan_args.content_filtering_args.max_file_size_mb);
+    }
+    if user_set(sub_matches, "no_binary") {
+        filters.no_binary = Some(scan_args.content_filtering_args.no_binary);
+    }
+    if user_set(sub_matches, "no_extract_archives") {
+        filters.no_extract_archives = Some(scan_args.content_filtering_args.no_extract_archives);
+    }
+    if user_set(sub_matches, "extraction_depth") {
+        filters.extraction_depth = Some(scan_args.content_filtering_args.extraction_depth);
+    }
+    if user_set(sub_matches, "no_inline_ignore") {
+        filters.no_inline_ignore = Some(scan_args.no_inline_ignore);
+    }
+    if user_set(sub_matches, "no_ignore_if_contains") {
+        filters.no_ignore_if_contains = Some(scan_args.no_ignore_if_contains);
+    }
+    if !scan_args.extra_ignore_comments.is_empty() {
+        filters.extra_ignore_comments = scan_args.extra_ignore_comments.clone();
+    }
+    if !scan_args.skip_aws_account.is_empty() {
+        filters.skip_aws_accounts = scan_args.skip_aws_account.clone();
+    }
+    if user_set(sub_matches, "skip_aws_account_file")
+        && let Some(p) = &scan_args.skip_aws_account_file
+    {
+        filters.skip_aws_account_file = Some(p.clone());
+    }
+    cfg.filters = filters;
+
+    // ---------- output ---------------------------------------------------
+    let mut output = OutputConfig::default();
+    if user_set(sub_matches, "format") {
+        output.format = Some(scan_args.output_args.format.into());
+    }
+    if user_set(sub_matches, "output")
+        && let Some(p) = &scan_args.output_args.output
+    {
+        output.path = Some(p.clone());
+    }
+    cfg.output = output;
+
+    // ---------- baseline ------------------------------------------------
+    let mut baseline = BaselineConfig::default();
+    if user_set(sub_matches, "baseline_file")
+        && let Some(p) = &scan_args.baseline_file
+    {
+        baseline.file = Some(p.clone());
+    }
+    if user_set(sub_matches, "manage_baseline") {
+        baseline.manage = Some(scan_args.manage_baseline);
+    }
+    cfg.baseline = baseline;
+
+    // ---------- alerts (defaults + webhooks via --alert-webhook) -------
+    let mut alerts = AlertsConfig::default();
+    let mut defaults = AlertsDefaultsConfig::default();
+    if user_set(sub_matches, "alert_format") {
+        defaults.format = scan_args.alert_format;
+    }
+    if user_set(sub_matches, "alert_on") {
+        defaults.on = Some(scan_args.alert_on);
+    }
+    if user_set(sub_matches, "alert_min_confidence") {
+        defaults.min_confidence = Some(scan_args.alert_min_confidence.into());
+    }
+    if user_set(sub_matches, "alert_include_secret") {
+        defaults.include_secret = Some(scan_args.alert_include_secret);
+    }
+    if user_set(sub_matches, "alert_report_url")
+        && let Some(u) = &scan_args.alert_report_url
+    {
+        defaults.report_url = Some(u.clone());
+    }
+    if user_set(sub_matches, "alert_detail") {
+        defaults.detail = Some(scan_args.alert_detail);
+    }
+    alerts.defaults = defaults;
+    // Each --alert-webhook URL becomes a webhook entry. Per-webhook overrides
+    // (slack vs teams, on=always, etc.) cannot be expressed as positional CLI
+    // flags, so the emitted entry just carries the URL — operators can edit
+    // the file to add per-sink behavior afterward.
+    for url in &scan_args.alert_webhook {
+        alerts.webhooks.push(WebhookConfig {
+            url: url.clone(),
+            format: None,
+            on: None,
+            min_confidence: None,
+            include_secret: None,
+            report_url: None,
+            detail: None,
+        });
+    }
+    cfg.alerts = alerts;
+
+    // ---------- global --------------------------------------------------
+    let mut g = GlobalConfig::default();
+    if user_set(sub_matches, "tls_mode") {
+        g.tls_mode = Some(global_args.tls_mode.into());
+    }
+    if user_set(sub_matches, "allow_internal_ips") {
+        g.allow_internal_ips = Some(global_args.allow_internal_ips);
+    }
+    if user_set(sub_matches, "no_update_check") {
+        g.no_update_check = Some(global_args.no_update_check);
+    }
+    if user_set(sub_matches, "user_agent_suffix")
+        && let Some(s) = &global_args.user_agent_suffix
+    {
+        g.user_agent_suffix = Some(s.clone());
+    }
+    if !global_args.endpoint.is_empty() {
+        g.endpoints = global_args.endpoint.clone();
+    }
+    if user_set(sub_matches, "endpoint_config")
+        && let Some(p) = &global_args.endpoint_config
+    {
+        g.endpoint_config = Some(p.clone());
+    }
+    cfg.global = g;
+
+    // ---------- git ----------------------------------------------------
+    let mut git = GitConfig::default();
+    if user_set(sub_matches, "git_clone_dir")
+        && let Some(p) = &scan_args.input_specifier_args.git_clone_dir
+    {
+        git.clone_dir = Some(p.clone());
+    }
+    if user_set(sub_matches, "keep_clones") {
+        git.keep_clones = Some(scan_args.input_specifier_args.keep_clones);
+    }
+    if user_set(sub_matches, "repo_clone_limit")
+        && let Some(n) = scan_args.input_specifier_args.repo_clone_limit
+    {
+        git.repo_clone_limit = Some(n);
+    }
+    if user_set(sub_matches, "include_contributors") {
+        git.include_contributors = Some(scan_args.input_specifier_args.include_contributors);
+    }
+    cfg.git = git;
+
+    // Serialize, then prune null/empty mappings so the YAML is concise.
+    let mut value =
+        serde_yaml::to_value(&cfg).context("serialize KingfisherConfig to YAML value")?;
+    prune_empty(&mut value);
+    let mut yaml = serde_yaml::to_string(&value).context("emit YAML")?;
+
+    if yaml.trim() == "{}" || yaml.trim().is_empty() {
+        // Avoid emitting "{}" — a no-op YAML is more confusing than empty.
+        yaml = String::from("# kingfisher.yaml — no flags supplied; nothing to emit.\n");
+    } else {
+        let header = "# kingfisher.yaml — generated by `kingfisher config init`.\n\
+                      # Edit freely; CLI flags always override config values.\n";
+        yaml = format!("{header}{yaml}");
+    }
+    Ok(yaml)
+}
+
+/// Recursively drop `null` values, empty sequences, and empty mappings from
+/// a [`serde_yaml::Value`]. Used by `build_config_yaml` to keep the output
+/// file as small as the user's actual flag set.
+fn prune_empty(value: &mut serde_yaml::Value) {
+    use serde_yaml::Value;
+    match value {
+        Value::Mapping(map) => {
+            let keys: Vec<_> = map.keys().cloned().collect();
+            for k in keys {
+                if let Some(v) = map.get_mut(&k) {
+                    prune_empty(v);
+                    let drop = match v {
+                        Value::Null => true,
+                        Value::Sequence(s) => s.is_empty(),
+                        Value::Mapping(m) => m.is_empty(),
+                        _ => false,
+                    };
+                    if drop {
+                        map.remove(&k);
+                    }
+                }
+            }
+        }
+        Value::Sequence(s) => {
+            for v in s.iter_mut() {
+                prune_empty(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Build a human-readable description of what the scan is targeting, for use
+/// in alert payloads (`Target:` header). The previous implementation looked
+/// only at the first local path, so scans that used git URLs, GitHub orgs,
+/// S3 buckets, etc. produced an empty target line. This walks the input
+/// specifiers in priority order and returns the first one that's set.
+fn describe_scan_target(args: &InputSpecifierArgs) -> Option<String> {
+    fn join_brief<T: std::fmt::Display>(items: &[T], label: &str) -> String {
+        match items.len() {
+            0 => String::new(),
+            1 => items[0].to_string(),
+            n if n <= 3 => items.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
+            n => format!("{} {label}", n),
+        }
+    }
+
+    // Local paths — the most common scan target.
+    if !args.path_inputs.is_empty() {
+        let s = if args.path_inputs.len() == 1 {
+            args.path_inputs[0].display().to_string()
+        } else if args.path_inputs.len() <= 3 {
+            args.path_inputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+        } else {
+            format!("{} paths", args.path_inputs.len())
+        };
+        return Some(s);
+    }
+    if !args.git_url.is_empty() {
+        return Some(join_brief(&args.git_url, "git URLs"));
+    }
+    if !args.github_user.is_empty() {
+        return Some(format!("github user: {}", join_brief(&args.github_user, "github users")));
+    }
+    if !args.github_organization.is_empty() {
+        return Some(format!(
+            "github org: {}",
+            join_brief(&args.github_organization, "github orgs")
+        ));
+    }
+    if args.all_github_organizations {
+        return Some("all GitHub organizations".to_string());
+    }
+    if !args.gitlab_user.is_empty() {
+        return Some(format!("gitlab user: {}", join_brief(&args.gitlab_user, "gitlab users")));
+    }
+    if !args.gitlab_group.is_empty() {
+        return Some(format!("gitlab group: {}", join_brief(&args.gitlab_group, "gitlab groups")));
+    }
+    if !args.huggingface_user.is_empty() || !args.huggingface_organization.is_empty() {
+        return Some("huggingface".to_string());
+    }
+    if !args.gitea_user.is_empty() || !args.gitea_organization.is_empty() {
+        return Some("gitea".to_string());
+    }
+    if !args.bitbucket_user.is_empty() || !args.bitbucket_workspace.is_empty() {
+        return Some("bitbucket".to_string());
+    }
+    if !args.azure_organization.is_empty() {
+        return Some(format!("azure: {}", join_brief(&args.azure_organization, "azure orgs")));
+    }
+    if let Some(b) = &args.s3_bucket {
+        return Some(format!("s3://{}{}", b, args.s3_prefix.as_deref().unwrap_or("")));
+    }
+    if let Some(b) = &args.gcs_bucket {
+        return Some(format!("gs://{}{}", b, args.gcs_prefix.as_deref().unwrap_or("")));
+    }
+    if !args.docker_image.is_empty() {
+        return Some(format!("docker: {}", join_brief(&args.docker_image, "images")));
+    }
+    if let Some(u) = &args.jira_url {
+        return Some(format!("jira: {}", u));
+    }
+    if let Some(u) = &args.confluence_url {
+        return Some(format!("confluence: {}", u));
+    }
+    if args.slack_query.is_some() {
+        return Some("slack search".to_string());
+    }
+    if args.teams_query.is_some() {
+        return Some("teams search".to_string());
+    }
+    if !args.postman_workspaces.is_empty()
+        || !args.postman_collections.is_empty()
+        || args.postman_all
+    {
+        return Some("postman".to_string());
+    }
+    None
+}
+
+/// Build the resolved list of alert sinks from CLI flags + config overrides.
+/// `scan_args.config_webhook_overrides` aligns with the trailing entries of
+/// `scan_args.alert_webhook` (those that came from `kingfisher.yaml`); CLI URLs
+/// always come first and use the scalar CLI flags.
+fn build_alert_sinks(
+    scan_args: &cli::commands::scan::ScanArgs,
+) -> Vec<kingfisher::alerts::AlertSink> {
+    let cli_count =
+        scan_args.alert_webhook.len().saturating_sub(scan_args.config_webhook_overrides.len());
+    scan_args
+        .alert_webhook
+        .iter()
+        .enumerate()
+        .map(|(i, url)| {
+            let override_ = if i >= cli_count {
+                scan_args.config_webhook_overrides.get(i - cli_count).cloned().unwrap_or_default()
+            } else {
+                cli::commands::scan::ConfigWebhookOverride::default()
+            };
+            let format = override_
+                .format
+                .or(scan_args.alert_format)
+                .unwrap_or_else(|| kingfisher::alerts::AlertFormat::infer_from_url(url));
+            kingfisher::alerts::AlertSink {
+                url: url.clone(),
+                format,
+                on: override_.on.unwrap_or(scan_args.alert_on),
+                min_confidence: override_.min_confidence.unwrap_or(scan_args.alert_min_confidence),
+                include_secret: override_.include_secret.unwrap_or(scan_args.alert_include_secret),
+                report_url: override_
+                    .report_url
+                    .clone()
+                    .or_else(|| scan_args.alert_report_url.clone()),
+                detail: override_.detail.unwrap_or(scan_args.alert_detail),
+            }
+        })
+        .collect()
 }
 
 pub fn determine_exit_code(datastore: &Arc<Mutex<findings_store::FindingsStore>>) -> i32 {
@@ -235,20 +1154,30 @@ pub fn determine_exit_code(datastore: &Arc<Mutex<findings_store::FindingsStore>>
     }
 }
 
-async fn async_main(args: CommandLineArgs) -> Result<()> {
+async fn async_main(args: CommandLineArgs, matches: clap::ArgMatches) -> Result<AsyncMainOutcome> {
     setup_logging(&args.global_args);
     let global_args = args.global_args.clone();
 
     match args.command {
         Command::SelfUpdate => {
+            // The explicit `kingfisher self-update` subcommand intentionally does NOT
+            // re-exec after updating: it has no further work to do, so simply exiting
+            // is the correct end-of-run behavior. The re-exec path is reserved for the
+            // global `--self-update` flag combined with another command (e.g. `scan`).
             let mut g = global_args;
             g.self_update = true;
             g.no_update_check = false;
             let _ = check_for_update_async(&g, None).await;
-            Ok(())
+            Ok(AsyncMainOutcome::Done)
         }
-        Command::View(view_args) => view::run(view_args).await,
-        Command::AccessMap(identity_args) => access_map::run(identity_args).await,
+        Command::View(view_args) => view::run(view_args).await.map(|_| AsyncMainOutcome::Done),
+        Command::AccessMap(identity_args) => {
+            access_map::run(identity_args).await.map(|_| AsyncMainOutcome::Done)
+        }
+        Command::Config(config_args) => {
+            run_config_command(config_args, &global_args, &matches)?;
+            Ok(AsyncMainOutcome::Done)
+        }
         Command::Validate(validate_args) => {
             let results =
                 direct_validate::run_direct_validation(&validate_args, &global_args).await?;
@@ -256,7 +1185,7 @@ async fn async_main(args: CommandLineArgs) -> Result<()> {
             direct_validate::print_results(&results, &validate_args.format, use_color);
             // Exit with code 0 if any result is valid, 1 if all invalid
             if direct_validate::any_valid(&results) {
-                Ok(())
+                Ok(AsyncMainOutcome::Done)
             } else {
                 std::process::exit(1);
             }
@@ -267,16 +1196,42 @@ async fn async_main(args: CommandLineArgs) -> Result<()> {
             direct_revoke::print_results(&results, &revoke_args.format, use_color);
             // Exit with code 0 if any result revoked, 1 if all failed
             if direct_revoke::any_revoked(&results) {
-                Ok(())
+                Ok(AsyncMainOutcome::Done)
             } else {
                 std::process::exit(1);
             }
         }
         command => {
             let update_status = check_for_update_async(&global_args, None).await;
+            // If the on-disk binary was just replaced by --self-update, return early so
+            // fn run() can drop the runtime and re-exec into the new binary. The current
+            // invocation will resume with the new code (e.g. updated rule set).
+            if update_status.was_self_updated {
+                return Ok(AsyncMainOutcome::Reexec);
+            }
             match command {
                 Command::Scan(scan_command) => match scan_command.into_operation()? {
                     ScanOperation::Scan(mut scan_args) => {
+                        // Resolve and merge kingfisher.yaml. Lists are concatenated onto CLI
+                        // flags; scalar fields are applied only when the user did not pass
+                        // the matching CLI flag (clap `ValueSource` lookup). Errors only
+                        // when --config explicitly points at a file we cannot parse.
+                        // Auto-discovery failures are silent.
+                        let loaded_config = load_project_config(global_args.config.as_deref())?;
+                        let scan_matches = matches.subcommand_matches("scan");
+                        let mut effective_global_args = global_args.clone();
+                        if let Some(cfg) = &loaded_config {
+                            apply_config(
+                                &mut scan_args,
+                                &mut effective_global_args,
+                                cfg,
+                                scan_matches,
+                            );
+                            // Re-publish the user-agent suffix in case the config supplied it
+                            // — the initial set_user_agent_suffix call ran before config load.
+                            set_user_agent_suffix(effective_global_args.user_agent_suffix.clone());
+                        }
+                        let global_args = effective_global_args;
                         if scan_args.view_report {
                             view::ensure_port_available(
                                 scan_args.view_report_port,
@@ -341,6 +1296,38 @@ async fn async_main(args: CommandLineArgs) -> Result<()> {
                             }
                         }
                         let exit_code = determine_exit_code(&datastore);
+
+                        // Dispatch alert webhooks (best-effort; failures are warned, not fatal).
+                        if !scan_args.alert_webhook.is_empty() {
+                            let alert_reporter = DetailsReporter {
+                                datastore: Arc::clone(&datastore),
+                                styles: Styles::new(global_args.use_color(std::io::stdout())),
+                                only_valid: scan_args.only_valid,
+                                audit_context: None,
+                            };
+                            match alert_reporter.build_finding_records(&scan_args) {
+                                Ok(records) => {
+                                    let target =
+                                        describe_scan_target(&scan_args.input_specifier_args);
+                                    let sinks: Vec<_> = build_alert_sinks(&scan_args)
+                                        .into_iter()
+                                        .filter(|sink| {
+                                            match kingfisher::alerts::validate_webhook_url(
+                                                &sink.url,
+                                            ) {
+                                                Ok(()) => true,
+                                                Err(e) => {
+                                                    warn!("alert dispatch: skipping sink: {}", e);
+                                                    false
+                                                }
+                                            }
+                                        })
+                                        .collect();
+                                    kingfisher::alerts::dispatch(&sinks, &records, target).await;
+                                }
+                                Err(e) => warn!("alert dispatch: failed to build findings: {}", e),
+                            }
+                        }
 
                         if scan_args.view_report {
                             let audit_context = ScanAuditContext {
@@ -499,11 +1486,14 @@ async fn async_main(args: CommandLineArgs) -> Result<()> {
                 Command::SelfUpdate => {
                     anyhow::bail!("SelfUpdate command should not reach this branch")
                 }
+                Command::Config(_) => {
+                    anyhow::bail!("Config command should not reach this branch")
+                }
             }
             if let Some(message) = &update_status.message {
                 info!("{}", message);
             }
-            Ok(())
+            Ok(AsyncMainOutcome::Done)
         }
     }
 }
@@ -650,6 +1640,14 @@ fn create_default_scan_args() -> cli::commands::scan::ScanArgs {
         validation_rps_rule: Vec::new(),
         full_validation_response: false,
         max_validation_response_length: 2048,
+        alert_webhook: Vec::new(),
+        alert_format: None,
+        alert_on: kingfisher::alerts::AlertOn::Findings,
+        alert_min_confidence: kingfisher::cli::commands::scan::ConfidenceLevel::Medium,
+        alert_include_secret: false,
+        alert_report_url: None,
+        alert_detail: kingfisher::alerts::AlertDetail::Auto,
+        config_webhook_overrides: Vec::new(),
     }
 }
 /// Run the rules check command
@@ -911,4 +1909,342 @@ pub fn run_rules_list(args: &RulesListArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod apply_config_tests {
+    //! End-to-end precedence tests for `apply_config` — confirm that:
+    //!   * a user-supplied `--flag` always wins over a config-file value, and
+    //!   * a config-file value wins over the clap `default_value_t` when the
+    //!     user did not pass the flag.
+    //!
+    //! The test parses a real `ArgMatches` via clap so the same code path
+    //! `value_source` reads from is exercised.
+
+    use clap::{ArgMatches, CommandFactory, FromArgMatches};
+    use kingfisher::cli::CommandLineArgs;
+    use kingfisher::cli::commands::output::ReportOutputFormat;
+    use kingfisher::cli::commands::scan::{ConfidenceLevel, ScanOperation};
+    use kingfisher::cli::config::{KingfisherConfig, parse_str};
+    use kingfisher::cli::global::Command;
+
+    fn parse(argv: &[&str]) -> (CommandLineArgs, ArgMatches) {
+        let matches =
+            CommandLineArgs::command().try_get_matches_from(argv).expect("argv should parse");
+        let args = CommandLineArgs::from_arg_matches(&matches).unwrap();
+        (args, matches)
+    }
+
+    fn into_scan(args: CommandLineArgs) -> kingfisher::cli::commands::scan::ScanArgs {
+        let cmd = match args.command {
+            Command::Scan(c) => c,
+            _ => panic!("expected scan subcommand"),
+        };
+        match cmd.into_operation().unwrap() {
+            ScanOperation::Scan(s) => s,
+            ScanOperation::ListRepositories(_) => panic!("expected scan op"),
+        }
+    }
+
+    #[test]
+    fn config_wins_when_cli_uses_default() {
+        let yaml = r#"
+scan:
+  confidence: high
+  redact: true
+output:
+  format: json
+"#;
+        let cfg: KingfisherConfig = parse_str(yaml).unwrap();
+        let (args, matches) = parse(&["kingfisher", "scan", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert_eq!(scan_args.confidence, ConfidenceLevel::High);
+        assert!(scan_args.redact);
+        assert_eq!(scan_args.output_args.format, ReportOutputFormat::Json);
+    }
+
+    #[test]
+    fn cli_beats_config_for_scalars() {
+        let yaml = r#"
+scan:
+  confidence: high
+  redact: true
+output:
+  format: json
+"#;
+        let cfg = parse_str(yaml).unwrap();
+        let (args, matches) =
+            parse(&["kingfisher", "scan", "--confidence", "low", "--format", "toon", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        // CLI wins
+        assert_eq!(scan_args.confidence, ConfidenceLevel::Low);
+        assert_eq!(scan_args.output_args.format, ReportOutputFormat::Toon);
+        // Bool with no CLI flag still picks up config
+        assert!(scan_args.redact);
+    }
+
+    #[test]
+    fn lists_are_concatenated_with_cli() {
+        let yaml = r#"
+filters:
+  skip_words: ["FROM_CONFIG"]
+  exclude: ["vendor/"]
+"#;
+        let cfg = parse_str(yaml).unwrap();
+        let (args, matches) = parse(&[
+            "kingfisher",
+            "scan",
+            "--skip-word",
+            "FROM_CLI",
+            "--exclude",
+            "node_modules/",
+            ".",
+        ]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert!(scan_args.skip_word.contains(&"FROM_CLI".to_string()));
+        assert!(scan_args.skip_word.contains(&"FROM_CONFIG".to_string()));
+        assert!(scan_args.content_filtering_args.exclude.contains(&"vendor/".to_string()));
+        assert!(scan_args.content_filtering_args.exclude.contains(&"node_modules/".to_string()));
+    }
+
+    #[test]
+    fn rules_enabled_replaces_default_but_appends_to_user_selection() {
+        // Case A: user passes --rule, config appends.
+        let yaml = r#"
+rules:
+  enabled: ["custom"]
+"#;
+        let cfg = parse_str(yaml).unwrap();
+        let (args, matches) = parse(&["kingfisher", "scan", "--rule", "default", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert!(scan_args.rules.rule.contains(&"default".to_string()));
+        assert!(scan_args.rules.rule.contains(&"custom".to_string()));
+
+        // Case B: user did not pass --rule (CLI default `["all"]` in effect),
+        // config replaces — otherwise users could never *narrow* the
+        // selection from the config.
+        let (args, matches) = parse(&["kingfisher", "scan", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert_eq!(scan_args.rules.rule, vec!["custom".to_string()]);
+    }
+
+    #[test]
+    fn validation_rps_per_rule_appended_as_strings() {
+        let yaml = r#"
+validation:
+  rps_per_rule:
+    kingfisher.aws: 1.5
+"#;
+        let cfg = parse_str(yaml).unwrap();
+        let (args, matches) =
+            parse(&["kingfisher", "scan", "--validation-rps-rule", "kingfisher.gcp=2.0", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert!(scan_args.validation_rps_rule.contains(&"kingfisher.gcp=2.0".to_string()));
+        assert!(scan_args.validation_rps_rule.contains(&"kingfisher.aws=1.5".to_string()));
+    }
+
+    #[test]
+    fn alerts_defaults_set_alert_globals_when_cli_default() {
+        let yaml = r#"
+alerts:
+  defaults:
+    min_confidence: high
+    include_secret: true
+    detail: summary
+"#;
+        let cfg = parse_str(yaml).unwrap();
+        let (args, matches) = parse(&["kingfisher", "scan", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert_eq!(scan_args.alert_min_confidence, ConfidenceLevel::High);
+        assert!(scan_args.alert_include_secret);
+        assert_eq!(scan_args.alert_detail, kingfisher::alerts::AlertDetail::Summary);
+    }
+
+    #[test]
+    fn cli_alert_flag_beats_config_default() {
+        let yaml = r#"
+alerts:
+  defaults:
+    min_confidence: high
+"#;
+        let cfg = parse_str(yaml).unwrap();
+        let (args, matches) = parse(&["kingfisher", "scan", "--alert-min-confidence", "low", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert_eq!(scan_args.alert_min_confidence, ConfidenceLevel::Low);
+    }
+
+    #[test]
+    fn config_init_round_trips_supplied_flags_only() {
+        // Take a CLI invocation, build a YAML config, parse it back, and
+        // check that the resulting KingfisherConfig has *only* what we passed
+        // (CLI defaults must not be reified into the config — that would
+        // freeze an arbitrary moment in time as a "user choice").
+        use kingfisher::cli::config::{ConfigConfidence, ConfigReportFormat, parse_str};
+
+        let argv = &[
+            "kingfisher",
+            "config",
+            "init",
+            "--confidence",
+            "high",
+            "--redact",
+            "--exclude",
+            "vendor/",
+            "--skip-word",
+            "EXAMPLE",
+            "--format",
+            "toon",
+            "--alert-min-confidence",
+            "high",
+            "--alert-webhook",
+            "https://hooks.slack.com/services/T0/B0/AAA",
+            "--tls-mode",
+            "lax",
+        ];
+        let matches = CommandLineArgs::command().try_get_matches_from(argv).unwrap();
+        let parsed = CommandLineArgs::from_arg_matches(&matches).unwrap();
+        let global_args = parsed.global_args.clone();
+
+        let init_matches =
+            matches.subcommand_matches("config").unwrap().subcommand_matches("init").unwrap();
+
+        // Recover the ScanArgs from the parsed `Config(Init(...))` branch.
+        let scan_args = match parsed.command {
+            Command::Config(c) => match c.command {
+                kingfisher::cli::commands::config_command::ConfigSubcommand::Init(args) => {
+                    args.scan_args
+                }
+            },
+            _ => panic!("expected config init"),
+        };
+
+        let yaml = super::build_config_yaml(&scan_args, &global_args, init_matches).unwrap();
+        let cfg = parse_str(&yaml).expect("emitted YAML must round-trip");
+
+        // Exact set of keys that should be present.
+        assert!(matches!(cfg.scan.confidence, Some(ConfigConfidence::High)));
+        assert_eq!(cfg.scan.redact, Some(true));
+        assert!(cfg.scan.no_dedup.is_none(), "should not emit unset bools");
+        assert!(cfg.scan.jobs.is_none(), "should not emit clap-default scalars");
+
+        assert_eq!(cfg.filters.exclude, vec!["vendor/".to_string()]);
+        assert_eq!(cfg.filters.skip_words, vec!["EXAMPLE".to_string()]);
+        assert!(cfg.filters.max_file_size_mb.is_none(), "should not emit unset filters");
+
+        assert!(matches!(cfg.output.format, Some(ConfigReportFormat::Toon)));
+        assert!(cfg.output.path.is_none());
+
+        assert!(matches!(cfg.alerts.defaults.min_confidence, Some(ConfigConfidence::High)));
+        assert_eq!(cfg.alerts.webhooks.len(), 1);
+        assert_eq!(cfg.alerts.webhooks[0].url, "https://hooks.slack.com/services/T0/B0/AAA");
+
+        assert!(matches!(cfg.global.tls_mode, Some(kingfisher::cli::config::ConfigTlsMode::Lax)));
+    }
+
+    #[test]
+    fn config_init_with_no_flags_emits_placeholder_comment() {
+        // Edge case: user runs `kingfisher config init` with no flags. The
+        // emitted file should still be valid YAML / a clear no-op rather
+        // than a bare `{}`.
+        let argv = &["kingfisher", "config", "init"];
+        let matches = CommandLineArgs::command().try_get_matches_from(argv).unwrap();
+        let parsed = CommandLineArgs::from_arg_matches(&matches).unwrap();
+        let global_args = parsed.global_args.clone();
+
+        let init_matches =
+            matches.subcommand_matches("config").unwrap().subcommand_matches("init").unwrap();
+
+        let scan_args = match parsed.command {
+            Command::Config(c) => match c.command {
+                kingfisher::cli::commands::config_command::ConfigSubcommand::Init(args) => {
+                    args.scan_args
+                }
+            },
+            _ => panic!("expected config init"),
+        };
+
+        let yaml = super::build_config_yaml(&scan_args, &global_args, init_matches).unwrap();
+        assert!(yaml.contains("no flags supplied"), "expected no-op header, got:\n{yaml}");
+        assert!(!yaml.trim().ends_with("{}"));
+    }
+
+    #[test]
+    fn global_section_updates_global_args_when_cli_default() {
+        let yaml = r#"
+global:
+  tls_mode: lax
+  allow_internal_ips: true
+  endpoints:
+    - github=https://ghe.example.com/api/v3/
+"#;
+        let cfg = parse_str(yaml).unwrap();
+        let (args, matches) = parse(&["kingfisher", "scan", "."]);
+        let mut global_args = args.global_args.clone();
+        let mut scan_args = into_scan(args);
+        super::apply_config(
+            &mut scan_args,
+            &mut global_args,
+            &cfg,
+            matches.subcommand_matches("scan"),
+        );
+        assert_eq!(global_args.tls_mode, kingfisher::cli::global::TlsMode::Lax);
+        assert!(global_args.allow_internal_ips);
+        assert_eq!(global_args.endpoint.len(), 1);
+    }
 }

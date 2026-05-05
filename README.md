@@ -59,7 +59,7 @@ Kingfisher is a high-performance, open source secret detection tool for source c
 - **Extensible rules**: 945 built-in rules (485 with live validation) plus YAML-defined custom rules ([docs/RULES.md](/docs/RULES.md))
 - **Validate & Revoke**: live validation of discovered secrets, plus direct revocation for supported platforms (GitHub, GitLab, Slack, AWS, GCP, and more) ([docs/USAGE.md](/docs/USAGE.md))
 - **Revocation support matrix**: current built-in revocation coverage across providers and rule IDs ([docs/REVOCATION_PROVIDERS.md](/docs/REVOCATION_PROVIDERS.md))
-- **Blast Radius Mapping**: instantly map leaked keys to their effective cloud identities and exposed resources with `--access-map`. Supports 42 providers (see table below).
+- **Blast Radius Mapping**: instantly map leaked keys to their effective cloud identities and exposed resources with `--access-map` (alias `--blast-radius`). Supports 43 providers (see table below).
 - **Broad AI SaaS coverage**: finds and validates tokens for OpenAI, Anthropic, Google Gemini, Cohere, AWS Bedrock, Voyage AI, Mistral, Stability AI, Replicate, xAI (Grok), Ollama, Langchain, Perplexity, Weights & Biases, Cerebras, Friendli, Fireworks.ai, NVIDIA NIM, Together.ai, Zhipu, and many more
 - **Compressed Files**: Supports extracting and scanning compressed files for secrets, including `tar.gz`/`bz2`/`xz`, ZIP-family containers (`zip`, `jar`, `docx`, `xlsx`, `pptx`, `odt`, `epub`, `hwpx`, and more), `asar`, HWP (Hancom OLE2/CFBF binary with DEFLATE/zlib stream decoding), and EGG (ALZip; raw-byte scanning)
 - **SQLite Database Scanning**: Automatically extracts and scans SQLite database contents for secrets stored in table rows
@@ -318,18 +318,39 @@ Kingfisher supports multiple installation methods:
 
 ## Verifying Releases
 
-Every Kingfisher release includes GitHub build attestations so you can verify that artifacts were built by our CI pipeline and haven't been tampered with.
+Every release ships [SLSA v1 build-provenance attestations](https://github.com/actions/attest-build-provenance) (Sigstore keyless OIDC) proving the artifact was built by our CI workflow at a known commit and hasn't been tampered with. Attestations are available via the GitHub attestation store or as the `multiple.intoto.jsonl` release asset.
 
-### GitHub attestations
+**Option 1 — `gh attestation verify`** (simplest; requires [GitHub CLI](https://cli.github.com/))
 
-Release artifacts have GitHub build attestations, verifiable with the GitHub CLI:
+```bash
+gh release download <version> --repo mongodb/kingfisher --pattern 'kingfisher-linux-x64.tgz'
+gh attestation verify kingfisher-linux-x64.tgz --repo mongodb/kingfisher
+```
+
+**Option 2 — `cosign`** (offline-friendly; requires [cosign](https://docs.sigstore.dev/system_config/installation/) ≥ 2.x)
 
 ```bash
 gh release download <version> --repo mongodb/kingfisher \
-  --pattern 'kingfisher-linux-x64.tgz'
+  --pattern 'kingfisher-linux-x64.tgz' --pattern 'multiple.intoto.jsonl'
 
-gh attestation verify kingfisher-linux-x64.tgz --repo mongodb/kingfisher
+cosign verify-blob-attestation \
+  --bundle multiple.intoto.jsonl \
+  --new-bundle-format \
+  --certificate-identity-regexp '^https://github.com/mongodb/kingfisher/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  kingfisher-linux-x64.tgz
 ```
+
+**Option 3 — `slsa-verifier`** (requires [slsa-verifier](https://github.com/slsa-framework/slsa-verifier))
+
+```bash
+slsa-verifier verify-artifact kingfisher-linux-x64.tgz \
+  --provenance-path multiple.intoto.jsonl \
+  --source-uri github.com/mongodb/kingfisher \
+  --source-tag <version>
+```
+
+A successful verification prints `Verified OK`. The attestation proves the artifact's SHA-256, the signing identity (the release workflow at a specific tag), and the source commit — all recorded in the public [Rekor transparency log](https://search.sigstore.dev/).
 
 
 ## Report Viewer (local and hosted)
@@ -481,7 +502,7 @@ The viewer can import Gitleaks JSON and TruffleHog JSON/JSONL in addition to nat
 
 > **Use the access map functionality only when you are authorized to inspect the target account, as Kingfisher will issue additional network requests to determine what access the secret grants**
 
-### Supported Access Map Providers (42)
+### Supported Access Map Providers (43)
 
 | Cloud & Infra | DevOps & CI/CD | SaaS & APIs | Data & Messaging |
 |:---|:---|:---|:---|
@@ -492,7 +513,7 @@ The viewer can import Gitleaks JSON and TruffleHog JSON/JSONL in addition to nat
 | DigitalOcean | Buildkite | Salesforce | Sendinblue / Brevo |
 | IBM Cloud | CircleCI | Shopify | Slack |
 | Terraform Cloud | Harness | Zendesk | Microsoft Teams |
-| | JFrog Artifactory | Stripe | |
+| | JFrog Artifactory | Stripe | Pinecone |
 | | JFrog Xray | Square | |
 | | Jira | PayPal | |
 | | | Plaid | |
@@ -766,7 +787,7 @@ kingfisher scan /tmp/repo --branch feature-1 \
 |----------|-------------|
 | [INSTALLATION.md](docs/INSTALLATION.md) | Complete installation guide including pre-commit hooks setup for git, pre-commit framework, and Husky |
 | [INTEGRATIONS.md](docs/INTEGRATIONS.md) | Platform-specific scanning guide (GitHub, GitLab, AWS S3, Docker, Jira, Confluence, Slack, etc.) |
-| [ACCESS_MAP.md](docs/ACCESS_MAP.md) | Access map: supported tokens and credential formats (42 providers including AWS, GCP, Azure, Alibaba Cloud, Stripe, Jira, monday.com, Asana, and more) |
+| [ACCESS_MAP.md](docs/ACCESS_MAP.md) | Access map: supported tokens and credential formats (43 providers including AWS, GCP, Azure, Alibaba Cloud, Stripe, Jira, monday.com, Asana, Pinecone, and more) |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | High-level Mermaid architecture diagram of the CLI, scanner pipeline, validation, access map, and outputs |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | Deployment models for self-serve CLI use, CI/pre-commit enforcement, centralized scanning, and embedded library integrations |
 | [ADVANCED.md](docs/ADVANCED.md) | Advanced features: baselines, confidence levels, validation tuning, CI scanning, and more |

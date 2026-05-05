@@ -417,6 +417,46 @@ kingfisher scan ./my-project \
   --exclude '[Tt]ests'
 ```
 
+### Project configuration file (`kingfisher.yaml`)
+
+Most `kingfisher scan` flags can be set as project defaults via a
+`kingfisher.yaml` file in the repo root (or any ancestor directory). CLI
+flags always win; config values fill in defaults. Lists are concatenated.
+
+```yaml
+# kingfisher.yaml
+scan:
+  confidence: high
+  redact: true
+output:
+  format: sarif
+  path: ./kingfisher.sarif
+filters:
+  exclude:
+    - vendor/
+    - "**/node_modules/**"
+alerts:
+  webhooks:
+    - url: https://hooks.slack.com/services/T0/B0/AAA
+      format: slack
+```
+
+```bash
+kingfisher scan .                          # auto-discovers ./kingfisher.yaml
+kingfisher scan . --config /etc/kf.yaml    # explicit path
+```
+
+Don't write the YAML by hand. If you already have a long `kingfisher scan`
+command, run the same flags under `kingfisher config init` to generate it:
+
+```bash
+kingfisher config init \
+  --confidence high --redact --exclude vendor/ --format sarif \
+  > kingfisher.yaml
+```
+
+See [`docs/CONFIG.md`](CONFIG.md) for the full schema and precedence rules.
+
 ### Scan changes in CI pipelines
 
 Limit scanning to the delta between your default branch and a pull request branch by combining `--since-commit` with `--branch` (defaults to `HEAD`). This only scans files that differ between the two references, which keeps CI runs fast while still blocking new secrets.
@@ -650,7 +690,7 @@ kingfisher scan github --organization my-org \
 
 ### Scan remote GitHub repository
 
-Pass a repository URL as a positional scan target to clone and scan its files and history. (The legacy `--git-url` flag still works but is deprecated.) When the URL targets GitHub and you pass `--include-contributors`, Kingfisher enumerates repository contributors and attempts to clone **all public repos owned by those contributors**—a common offensive and blue-team pivot when developers leak secrets in personal or side projects. Use `--repo-clone-limit` to cap how many repositories are cloned during this enumeration.
+Pass a repository URL as a positional scan target to clone and scan its files and history. (The legacy `--git-url` flag still works but is deprecated.) When the URL targets GitHub and you pass `--include-contributors`, Kingfisher enumerates repository contributors and attempts to clone the public repos owned by those contributors—a common offensive and blue-team pivot when developers leak secrets in personal or side projects. By default Kingfisher excludes forks; pass `--github-repo-type all` to include them or `--github-repo-type fork` for forks only. Use `--repo-clone-limit` to cap how many repositories are cloned during this enumeration.
 
 **NOTE**: This may cause you to be temporarily rate-limited by GitHub. Providing a token (`KF_GITHUB_TOKEN`) will provide a higher rate limit.
 

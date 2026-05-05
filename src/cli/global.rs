@@ -3,14 +3,16 @@ use std::path::PathBuf;
 
 use std::sync::LazyLock;
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    ArgAction, ArgMatches, Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 use strum::Display;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tracing::Level;
 
 use crate::cli::commands::{
-    access_map::AccessMapArgs, revoke::RevokeArgs, rules::RulesArgs, scan::ScanCommandArgs,
-    validate::ValidateArgs, view::ViewArgs,
+    access_map::AccessMapArgs, config_command::ConfigArgs, revoke::RevokeArgs, rules::RulesArgs,
+    scan::ScanCommandArgs, validate::ValidateArgs, view::ViewArgs,
 };
 
 #[deny(missing_docs)]
@@ -31,8 +33,17 @@ impl CommandLineArgs {
     ///
     /// Automatically respects `NO_COLOR` and maps `--quiet` into disabling progress bars.
     pub fn parse_args() -> Self {
-        // Use standard `Parser::parse` for simplicity
-        let mut args = CommandLineArgs::parse();
+        Self::parse_args_with_matches().0
+    }
+
+    /// Parse command-line arguments and also return the raw [`ArgMatches`] so
+    /// callers can use [`ArgMatches::value_source`] to distinguish "user
+    /// supplied this flag" from "clap filled in a default" — required for
+    /// project-config precedence (`CLI > env > config > built-in default`).
+    pub fn parse_args_with_matches() -> (Self, ArgMatches) {
+        let matches = CommandLineArgs::command().get_matches();
+        let mut args = CommandLineArgs::from_arg_matches(&matches)
+            .expect("clap-derive guarantees a successful round-trip");
 
         // Apply NO_COLOR environment variable
         if std::env::var("NO_COLOR").is_ok() {
@@ -58,7 +69,7 @@ impl CommandLineArgs {
             }
         }
 
-        args
+        (args, matches)
     }
 }
 
@@ -79,11 +90,14 @@ pub enum Command {
     Revoke(RevokeArgs),
 
     /// Map a cloud credential to its identity, permissions, and blast radius
-    #[command(name = "access-map", alias = "access_map")]
+    #[command(name = "access-map", aliases = ["access_map", "blast-radius", "blast_radius"])]
     AccessMap(AccessMapArgs),
 
     /// View Kingfisher JSON/JSONL reports in a local web UI
     View(ViewArgs),
+
+    /// Generate or inspect `kingfisher.yaml` project config files
+    Config(ConfigArgs),
 
     /// Update the Kingfisher binary
     #[command(name = "update", alias = "self-update")]
@@ -155,6 +169,15 @@ pub struct GlobalArgs {
     #[arg(global = true, long = "endpoint-config", value_name = "FILE")]
     pub endpoint_config: Option<PathBuf>,
 
+    /// Path to a `kingfisher.yaml` project config file.
+    /// If omitted, Kingfisher walks up from the current working directory
+    /// looking for `kingfisher.yaml`. List-typed config values are concatenated
+    /// onto matching CLI flags; scalar config values are applied only when the
+    /// matching `--flag` was not passed (precedence: CLI > env > config >
+    /// built-in default). See `docs/CONFIG.md` for the full schema.
+    #[arg(global = true, long = "config", value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
     // Internal fields (not CLI arguments)
     #[clap(skip)]
     pub color: Mode,
@@ -176,6 +199,7 @@ impl Default for GlobalArgs {
             user_agent_suffix: None,
             endpoint: Vec::new(),
             endpoint_config: None,
+            config: None,
             color: Mode::Auto,
             progress: Mode::Auto,
         }

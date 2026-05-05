@@ -422,6 +422,46 @@ kingfisher scan ./my-project \
   --exclude '[Tt]ests'
 ```
 
+### Project configuration file (`kingfisher.yaml`)
+
+Most `kingfisher scan` flags can be set as project defaults via a
+`kingfisher.yaml` file in the repo root (or any ancestor directory). CLI
+flags always win; config values fill in defaults. Lists are concatenated.
+
+```yaml
+# kingfisher.yaml
+scan:
+  confidence: high
+  redact: true
+output:
+  format: sarif
+  path: ./kingfisher.sarif
+filters:
+  exclude:
+    - vendor/
+    - "**/node_modules/**"
+alerts:
+  webhooks:
+    - url: https://hooks.slack.com/services/T0/B0/AAA
+      format: slack
+```
+
+```bash
+kingfisher scan .                          # auto-discovers ./kingfisher.yaml
+kingfisher scan . --config /etc/kf.yaml    # explicit path
+```
+
+Don't write the YAML by hand. If you already have a long `kingfisher scan`
+command, run the same flags under `kingfisher config init` to generate it:
+
+```bash
+kingfisher config init \
+  --confidence high --redact --exclude vendor/ --format sarif \
+  > kingfisher.yaml
+```
+
+See [`docs/CONFIG.md`](../usage/configuration.md) for the full schema and precedence rules.
+
 ### Scan changes in CI pipelines
 
 Limit scanning to the delta between your default branch and a pull request branch by combining `--since-commit` with `--branch` (defaults to `HEAD`). This only scans files that differ between the two references, which keeps CI runs fast while still blocking new secrets.

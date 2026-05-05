@@ -214,6 +214,60 @@ kingfisher scan https://github.com/org/repo.git --repo-artifacts
 KF_GITHUB_TOKEN="ghp_…" kingfisher scan https://github.com/org/private_repo.git --repo-artifacts
 ```
 
+### Scan a GitHub Enterprise / self-hosted GitHub instance
+
+For GitHub Enterprise Server (GHES) or any self-hosted GitHub install, you
+need two flags:
+
+- `--github-api-url <URL>` — points the **enumeration / clone** flow at the
+  custom API root (typically `https://ghe.example.com/api/v3/`).
+- `--endpoint github=<URL>` — points the **token validation / revocation**
+  flow at the same instance, so any GitHub PATs Kingfisher discovers in the
+  scanned source are checked against your GHE rather than `api.github.com`.
+
+```bash
+# 1. Scan every org repo on GHE and validate discovered tokens against the same instance
+KF_GITHUB_TOKEN="ghp_…" kingfisher scan github \
+  --organization my-org \
+  --github-api-url https://ghe.corp.example.com/api/v3/ \
+  --endpoint github=https://ghe.corp.example.com
+
+# 2. Scan a single GHE repo by URL (positional target)
+KF_GITHUB_TOKEN="ghp_…" kingfisher scan https://ghe.corp.example.com/org/repo.git \
+  --endpoint github=https://ghe.corp.example.com
+
+# 3. Scan ALL orgs on a GHE instance (requires non-default --github-api-url)
+KF_GITHUB_TOKEN="ghp_…" kingfisher scan github \
+  --all-orgs \
+  --github-api-url https://ghe.corp.example.com/api/v3/ \
+  --endpoint github=https://ghe.corp.example.com
+
+# 4. GHE on a private network — add --allow-internal-ips so the validator
+#    can reach RFC1918 / loopback hosts (SSRF guard is on by default).
+KF_GITHUB_TOKEN="ghp_…" kingfisher scan github \
+  --organization my-org \
+  --github-api-url https://ghe.internal/api/v3/ \
+  --endpoint github=https://ghe.internal \
+  --allow-internal-ips
+
+# 5. Validate a single PAT against GHE without scanning anything
+kingfisher validate --rule github \
+  --endpoint github=https://ghe.corp.example.com \
+  "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 6. Revoke (delete) a confirmed-leaked PAT against GHE
+kingfisher revoke --rule github \
+  --endpoint github=https://ghe.corp.example.com \
+  "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+`--github-api-url` is the GHE *cloning* root that Kingfisher walks to
+enumerate orgs, repos, and contributors. `--endpoint github=…` is the
+*validator* root used to live-check discovered tokens. They are usually the
+same host, but they're separate flags because some deployments front-load
+auth (an SSO portal for repo access vs. a direct API endpoint for token
+validation).
+
 ## GitLab
 
 ### Scan GitLab group (requires `KF_GITLAB_TOKEN`)
@@ -282,6 +336,99 @@ kingfisher scan https://gitlab.com/group/project.git --repo-artifacts
 
 # Private projects or artifacts
 KF_GITLAB_TOKEN="glpat-…" kingfisher scan https://gitlab.com/group/private_project.git --repo-artifacts
+```
+
+### Scan a self-hosted (Omnibus / Cloud Native) GitLab instance
+
+For GitLab self-hosted (Omnibus, Helm, or Cloud Native), pair the
+enumeration flag with a matching validation endpoint:
+
+- `--gitlab-api-url <URL>` — points the **enumeration / clone** flow at
+  the custom GitLab root (typically `https://gitlab.example.com/`).
+- `--endpoint gitlab=<URL>` — points the **token validation / revocation**
+  flow at the same instance, so any GitLab PATs found in the scanned
+  source are checked against your self-hosted GitLab rather than
+  `gitlab.com`.
+
+```bash
+# 1. Scan a self-hosted group and validate discovered tokens against the same instance
+KF_GITLAB_TOKEN="glpat-…" kingfisher scan gitlab \
+  --group my-group \
+  --include-subgroups \
+  --gitlab-api-url https://gitlab.corp.example.com/ \
+  --endpoint gitlab=https://gitlab.corp.example.com
+
+# 2. Scan a single self-hosted GitLab project by URL
+KF_GITLAB_TOKEN="glpat-…" kingfisher scan https://gitlab.corp.example.com/group/project.git \
+  --endpoint gitlab=https://gitlab.corp.example.com
+
+# 3. Scan ALL groups on a self-hosted GitLab (requires non-default --gitlab-api-url)
+KF_GITLAB_TOKEN="glpat-…" kingfisher scan gitlab \
+  --all-groups \
+  --gitlab-api-url https://gitlab.corp.example.com/ \
+  --endpoint gitlab=https://gitlab.corp.example.com
+
+# 4. Self-hosted GitLab on a private network — add --allow-internal-ips so
+#    the validator can reach RFC1918 / loopback hosts.
+KF_GITLAB_TOKEN="glpat-…" kingfisher scan gitlab \
+  --group my-group \
+  --gitlab-api-url https://gitlab.internal/ \
+  --endpoint gitlab=https://gitlab.internal \
+  --allow-internal-ips
+
+# 5. Validate a single PAT against self-hosted GitLab without scanning anything
+kingfisher validate --rule gitlab \
+  --endpoint gitlab=https://gitlab.corp.example.com \
+  "glpat-xxxxxxxxxxxxxxxxxxxx"
+
+# 6. Revoke (delete) a confirmed-leaked PAT against self-hosted GitLab
+kingfisher revoke --rule gitlab \
+  --endpoint gitlab=https://gitlab.corp.example.com \
+  "glpat-xxxxxxxxxxxxxxxxxxxx"
+```
+
+### Many endpoints at once: `--endpoint-config`
+
+If you maintain a fleet of self-hosted instances (GHE, self-hosted GitLab,
+Gitea, Jira DC, Confluence, Artifactory), put them in a single YAML file
+and reference it instead of repeating `--endpoint` on every command:
+
+```yaml
+# kingfisher-endpoints.yml
+endpoints:
+  github: https://ghe.corp.example.com
+  gitlab: https://gitlab.corp.example.com
+  gitea: https://gitea.corp.example.com
+  jira: https://jira.corp.example.com
+  confluence: https://wiki.corp.example.com
+  artifactory: http://artifactory.internal:8081
+```
+
+```bash
+KF_GITHUB_TOKEN="ghp_…" KF_GITLAB_TOKEN="glpat-…" kingfisher scan github \
+  --organization my-org \
+  --github-api-url https://ghe.corp.example.com/api/v3/ \
+  --endpoint-config ./kingfisher-endpoints.yml \
+  --allow-internal-ips
+```
+
+### Tip: bake the endpoints into `kingfisher.yaml`
+
+Once you've worked out the right flags, capture them as project defaults
+so every scan uses the same config:
+
+```bash
+kingfisher config init \
+  --github-api-url https://ghe.corp.example.com/api/v3/ \
+  --gitlab-api-url https://gitlab.corp.example.com/ \
+  --endpoint github=https://ghe.corp.example.com \
+  --endpoint gitlab=https://gitlab.corp.example.com \
+  --allow-internal-ips \
+  > kingfisher.yaml
+
+# Then every scan inherits the same self-hosted defaults:
+KF_GITHUB_TOKEN="ghp_…" kingfisher scan github --organization my-org \
+  --config ./kingfisher.yaml
 ```
 
 ### List GitLab repositories
@@ -658,7 +805,7 @@ The token is sent as the `X-Api-Key` header. Either `KF_POSTMAN_TOKEN` or `POSTM
 
 > Top-level `kingfisher scan --postman-*` flags remain accepted as hidden aliases for backward compatibility, but new usage should prefer the `kingfisher scan postman` subcommand shown above.
 
-**Out of scope:** Postman Vault secrets are client-side and not reachable via the API. The Postman API Network does not expose a search endpoint; supply specific public-workspace IDs via `kingfisher scan postman --workspace` to scan public surfaces.
+**Out of scope:** Postman Vault secrets are client-side and not reachable via the API. The Postman API Network does not expose a search endpoint; supply specific public-workspace IDs via `--postman-workspace` to scan public surfaces.
 
 ## Environment Variables
 

@@ -298,31 +298,24 @@ fn setup_logging(global_args: &GlobalArgs) {
 }
 
 /// Resolve and read a `kingfisher.yaml` project config.
-/// - Explicit `--config <PATH>` is required to exist; missing/unreadable is an error.
-/// - Otherwise we walk up from CWD looking for `kingfisher.yaml`. Missing is fine.
+///
+/// The config file is loaded **only** when the user passes `--config <PATH>`
+/// explicitly. There is intentionally no auto-discovery — relying on a
+/// `kingfisher.yaml` that happens to sit in the cwd (or any ancestor
+/// directory) makes scan results depend on where the binary was invoked
+/// from, which is too easy to get wrong in CI. If the explicit path is
+/// missing or fails to parse, that is a fatal error.
 fn load_project_config(
     explicit: Option<&std::path::Path>,
 ) -> Result<Option<kingfisher::cli::config::KingfisherConfig>> {
-    let path = match explicit {
-        Some(p) => Some(p.to_path_buf()),
-        None => {
-            let cwd = std::env::current_dir().context("read CWD for config discovery")?;
-            kingfisher::cli::config::discover_path(&cwd)
-        }
-    };
-    match path {
-        Some(p) => {
-            let bytes =
-                std::fs::read(&p).with_context(|| format!("read config {}", p.display()))?;
-            let yaml = String::from_utf8(bytes)
-                .with_context(|| format!("config {} is not UTF-8", p.display()))?;
-            let cfg = kingfisher::cli::config::parse_str(&yaml)
-                .with_context(|| format!("parse config {}", p.display()))?;
-            info!("loaded config from {}", p.display());
-            Ok(Some(cfg))
-        }
-        None => Ok(None),
-    }
+    let Some(p) = explicit else { return Ok(None) };
+    let bytes = std::fs::read(p).with_context(|| format!("read config {}", p.display()))?;
+    let yaml =
+        String::from_utf8(bytes).with_context(|| format!("config {} is not UTF-8", p.display()))?;
+    let cfg = kingfisher::cli::config::parse_str(&yaml)
+        .with_context(|| format!("parse config {}", p.display()))?;
+    info!("loaded config from {}", p.display());
+    Ok(Some(cfg))
 }
 
 /// Merge config-file values into clap-parsed args.
@@ -632,6 +625,24 @@ fn apply_config(
             scan_args.input_specifier_args.include_contributors = v;
         }
     }
+    // Provider API roots for enumeration / cloning. We accept the YAML value
+    // as `String` (the schema serializer keeps it stable across `Url`'s
+    // trailing-slash normalization), then parse to a `Url` for the runtime
+    // field. parse_str() already validated this — `unwrap_or_default()`
+    // would mask a real config bug, so we re-parse and *fail loud* if the
+    // string somehow does not parse here.
+    if let Some(u) = &cfg.git.github_api_url
+        && config_wins(scan_matches, "github_api_url")
+        && let Ok(parsed) = url::Url::parse(u)
+    {
+        scan_args.input_specifier_args.github_api_url = parsed;
+    }
+    if let Some(u) = &cfg.git.gitlab_api_url
+        && config_wins(scan_matches, "gitlab_api_url")
+        && let Ok(parsed) = url::Url::parse(u)
+    {
+        scan_args.input_specifier_args.gitlab_api_url = parsed;
+    }
 }
 
 /// Run `kingfisher config <subcommand>`.
@@ -934,6 +945,16 @@ fn build_config_yaml(
     }
     if user_set(sub_matches, "include_contributors") {
         git.include_contributors = Some(scan_args.input_specifier_args.include_contributors);
+    }
+    // Provider API roots are stored as `Url` on the runtime side; the YAML
+    // schema is a `String` so the emitted file matches exactly what the
+    // user typed (Url adds a trailing `/` on bare-host URLs which would
+    // surprise diff-watchers).
+    if user_set(sub_matches, "github_api_url") {
+        git.github_api_url = Some(scan_args.input_specifier_args.github_api_url.to_string());
+    }
+    if user_set(sub_matches, "gitlab_api_url") {
+        git.gitlab_api_url = Some(scan_args.input_specifier_args.gitlab_api_url.to_string());
     }
     cfg.git = git;
 

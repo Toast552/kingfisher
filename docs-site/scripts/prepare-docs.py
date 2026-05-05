@@ -108,6 +108,7 @@ LINK_REWRITES = {
     "ADVANCED.md": "../usage/advanced.md",
     "BASELINE.md": "../usage/baseline.md",
     "DEPLOYMENT.md": "../usage/deployment.md",
+    "CONFIG.md": "../usage/configuration.md",
     "ACCESS_MAP.md": "../features/access-map.md",
     "REVOCATION_PROVIDERS.md": "../features/revocation.md",
     "TOKEN_REVOCATION_SUPPORT.md": "../features/revocation.md",
